@@ -1,0 +1,16 @@
+[workspace]
+
+[package]
+name = "sdfer"
+description = "SDF (Signed Distance Field) generation algorithms"
+repository = "https://github.com/LykenSol/sdfer"
+homepage = "https://github.com/LykenSol/sdfer"
+documentation = "https://docs.rs/sdfer"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# [dev-dependencies]
+# base64 = "0.13"
+# image = "0.24.6"
+# ab_glyph = "0.2.20"
