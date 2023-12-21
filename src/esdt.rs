@@ -1,10 +1,13 @@
-//! Rust port of the ESDT ("Euclidean Subpixel Distance Transform") algorithm,
-//! originally published as the [`@use-gpu/glyph`](https://www.npmjs.com/package/@use-gpu/glyph)
-//! `npm` package, and described in <https://acko.net/blog/subpixel-distance-transform/>.
+//! Rust port of the ESDT ("Euclidean Subpixel Distance Transform") algorithm.
+//!
+//!
+//! This algorithm was originally published as the [`@use-gpu/glyph`](https://www.npmjs.com/package/@use-gpu/glyph)
+//! `npm` package, and was described in <https://acko.net/blog/subpixel-distance-transform/>.
 
-use crate::SdfUnorm8;
+use crate::img::{Bitmap, Image2d, NDCursor, NDCursorExt as _, Unorm8};
 
-#[cfg(replace_f32_with_f64)]
+// HACK(eddyb) only exists to allow toggling precision for testing purposes.
+#[cfg(sdfer_use_f64_instead_of_f32)]
 type f32 = f64;
 
 #[derive(Copy, Clone, Debug)]
@@ -32,23 +35,34 @@ impl Default for Params {
     }
 }
 
+/// Opaque `struct` allowing buffer reuse between SDF computations, instead of
+/// reallocating all the buffers every time.
+#[derive(Default)]
+pub struct ReusableBuffers(ReusableBuffers2d, ReusableBuffers1d);
+
 // Convert grayscale glyph to SDF
-pub fn glyph_to_sdf(data: &mut [u8], w: usize, h: usize, params: Params) -> SdfUnorm8 {
+pub fn glyph_to_sdf(
+    glyph: &mut Image2d<Unorm8, impl AsMut<[Unorm8]> + AsRef<[Unorm8]>>,
+    params: Params,
+    reuse_bufs: Option<ReusableBuffers>,
+) -> (Image2d<Unorm8>, ReusableBuffers) {
     if params.solidify {
-        solidify_alpha(data, w, h);
+        solidify_alpha(glyph.reborrow_mut());
     }
-    glyph_to_esdt(data, w, h, params)
+    glyph_to_esdt(glyph.reborrow_mut(), params, reuse_bufs)
 }
 
 // Solidify semi-transparent areas
-fn solidify_alpha(data: &mut [u8], w: usize, h: usize) {
+fn solidify_alpha(mut glyph: Image2d<Unorm8, &mut [Unorm8]>) {
+    let (w, h) = (glyph.width(), glyph.height());
+
     let mut mask: Vec<u8> = vec![0; w * h];
 
     let get_data = |x: isize, y: isize| {
         if x >= 0 && (x as usize) < w && y >= 0 && (y as usize) < h {
-            data[(y as usize) * w + (x as usize)]
+            glyph[(x as usize, y as usize)]
         } else {
-            0
+            Unorm8::MIN
         }
     };
 
@@ -61,7 +75,8 @@ fn solidify_alpha(data: &mut [u8], w: usize, h: usize) {
             let o = (x as usize) + (y as usize) * w;
 
             let a = get_data(x, y);
-            if a == 0 || a >= 254 {
+            // FIXME(eddyb) audit all comparisons with `254` and try removing them.
+            if a == Unorm8::MIN || a >= Unorm8::from_bits(254) {
                 continue;
             }
 
@@ -76,6 +91,9 @@ fn solidify_alpha(data: &mut [u8], w: usize, h: usize) {
                 .reduce(|(a_min, a_max), (b_min, b_max)| (a_min.min(b_min), a_max.max(b_max)))
                 .unwrap();
 
+            let [a, min, max] = [a, min, max].map(Unorm8::to_bits);
+
+            // FIXME(eddyb) audit all comparisons with `254` and try removing them.
             if (max - min) < 16 && min > 0 && max < 254 {
                 // Spread to 4 neighbors with max
                 mask[o - 1] = mask[o - 1].max(a);
@@ -97,8 +115,9 @@ fn solidify_alpha(data: &mut [u8], w: usize, h: usize) {
     // Sample 3x3 area for alpha normalization factor
     for y in 0..h {
         for x in 0..w {
-            let a = &mut data[y * w + x];
-            if *a == 0 || *a >= 254 {
+            let a = &mut glyph[(x, y)];
+            // FIXME(eddyb) audit all comparisons with `254` and try removing them.
+            if *a == Unorm8::MIN || *a >= Unorm8::from_bits(254) {
                 continue;
             }
 
@@ -119,14 +138,18 @@ fn solidify_alpha(data: &mut [u8], w: usize, h: usize) {
                 .find(|&x| x != 0)
                 .unwrap_or(0);
             if m != 0 {
-                *a = (*a as f32 / m as f32 * 255.0) as u8;
+                *a = Unorm8::from_bits((a.to_bits() as f32 / m as f32 * 255.0) as u8);
             }
         }
     }
 }
 
 // Convert grayscale or color glyph to SDF using subpixel distance transform
-fn glyph_to_esdt(data: &mut [u8], w: usize, h: usize, params: Params) -> SdfUnorm8 {
+fn glyph_to_esdt(
+    mut glyph: Image2d<Unorm8, &mut [Unorm8]>,
+    params: Params,
+    reuse_bufs: Option<ReusableBuffers>,
+) -> (Image2d<Unorm8>, ReusableBuffers) {
     // FIXME(eddyb) use `Params` itself directly in more places.
     let Params {
         pad,
@@ -136,59 +159,30 @@ fn glyph_to_esdt(data: &mut [u8], w: usize, h: usize, params: Params) -> SdfUnor
         preprocess,
     } = params;
 
-    let wp = w + pad * 2;
-    let hp = h + pad * 2;
-    let np = wp * hp;
-    let sp = wp.max(hp);
+    let wp = glyph.width() + pad * 2;
+    let hp = glyph.height() + pad * 2;
 
-    let mut state = State::new(sp);
+    let mut state = State::from_glyph(glyph.reborrow_mut(), params, reuse_bufs);
 
-    state.init_from_alpha(data, w, h, pad);
-    state.compute_subpixel_offsets(data, w, h, pad, preprocess);
-
-    {
-        let State {
-            outer,
-            inner,
-            xo,
-            yo,
-            xi,
-            yi,
-            f,
-            z,
-            b,
-            t,
-            v,
-            ..
-        } = &mut state;
-        esdt(outer, xo, yo, wp, hp, f, z, b, t, v);
-        esdt(inner, xi, yi, wp, hp, f, z, b, t, v);
-    }
+    state.esdt_outer_and_inner(wp, hp);
 
     // FIXME(eddyb) implement.
-    // if postprocess { state.relax_subpixel_offsets(data, w, h, pad); }
+    // if postprocess { state.relax_subpixel_offsets(glyph, pad); }
 
-    let mut alpha: Vec<u8> = (0..np)
-        .map(|i| {
-            let State { xo, yo, xi, yi, .. } = &state;
-            let outer = ((sqr(xo[i]) + sqr(yo[i])).sqrt() - 0.5).max(0.0);
-            let inner = ((sqr(xi[i]) + sqr(yi[i])).sqrt() - 0.5).max(0.0);
-            let d = if outer >= inner { outer } else { -inner };
-            (255.0 - 255.0 * (d / radius + cutoff))
-                .round()
-                .clamp(0.0, 255.0) as u8
-        })
-        .collect();
+    let mut sdf = Image2d::from_fn(wp, hp, |x, y| {
+        let i = y * wp + x;
+        let ReusableBuffers2d { xo, yo, xi, yi, .. } = &state.bufs_2d;
+        let outer = ((xo[i].powi(2) + yo[i].powi(2)).sqrt() - 0.5).max(0.0);
+        let inner = ((xi[i].powi(2) + yi[i].powi(2)).sqrt() - 0.5).max(0.0);
+        let d = if outer >= inner { outer } else { -inner };
+        Unorm8::encode(1.0 - (d / radius + cutoff))
+    });
 
     if !preprocess {
-        paint_into_distance_field(&mut alpha, data, w, h, pad, radius, cutoff);
+        paint_into_distance_field(&mut sdf, glyph.reborrow(), params);
     }
 
-    SdfUnorm8 {
-        width: wp,
-        height: hp,
-        data: alpha,
-    }
+    (sdf, ReusableBuffers(state.bufs_2d, state.reuse_bufs_1d))
 }
 
 // Helpers
@@ -202,171 +196,126 @@ fn is_solid(x: f32) -> bool {
     x == 0.0 || x == 1.0
 }
 
-// FIXME(eddyb) replace with `.powi(2)`
-fn sqr(x: f32) -> f32 {
-    x * x
-}
-
 // Paint original alpha channel into final SDF when gray
 fn paint_into_distance_field(
-    image: &mut [u8],
-    data: &[u8],
-    w: usize,
-    h: usize,
-    pad: usize,
-    radius: f32,
-    cutoff: f32,
+    sdf: &mut Image2d<Unorm8>,
+    glyph: Image2d<Unorm8, &[Unorm8]>,
+    params: Params,
 ) {
-    let wp = w + pad * 2;
+    let Params {
+        pad,
+        radius,
+        cutoff,
+        ..
+    } = params;
 
-    let get_data = |x, y| data[y * w + x] as f32 / 255.0;
-
-    for y in 0..h {
-        for x in 0..w {
-            let a = get_data(x, y);
+    for y in 0..glyph.height() {
+        for x in 0..glyph.width() {
+            let a = glyph[(x, y)].decode();
             if !is_solid(a) {
-                let j = x + pad + (y + pad) * wp;
                 let d = 0.5 - a;
-                image[j] = (255.0 - 255.0 * (d / radius + cutoff))
-                    .round()
-                    .clamp(0.0, 255.0) as u8;
+                sdf[(x + pad, y + pad)] = Unorm8::encode(1.0 - (d / radius + cutoff));
             }
         }
     }
 }
 
-struct State {
-    // FIXME(eddyb) `outer`/`inner` seem to always contain 0 or +∞ ???
-    // (should they just be bitmaps?)
-
+/// 2D buffers, which get reused (see also `ReusableBuffers` itself).
+#[derive(Default)]
+struct ReusableBuffers2d {
     // FIXME(eddyb) group `outer` with `{x,y}o`.
-    outer: Vec<f32>,
+    outer: Bitmap,
     // FIXME(eddyb) group `inner` with `{x,y}i``.
-    inner: Vec<f32>,
+    inner: Bitmap,
 
     xo: Vec<f32>,
     yo: Vec<f32>,
     xi: Vec<f32>,
     yi: Vec<f32>,
-
-    // Group these separately (they're merely 1D temporary buffers).
-    f: Vec<f32>, // Squared distance
-    z: Vec<f32>, // Voronoi threshold
-    b: Vec<f32>, // Subpixel offset parallel
-    t: Vec<f32>, // Subpixel offset perpendicular
-    v: Vec<u16>, // Array index
 }
 
-// FIXME(eddyb) this is a pretty misleading name.
-const INF: f32 = 1e10;
+struct State {
+    // FIXME(eddyb) do the grouping suggested in `ReusableBuffers2d`, to have
+    // `outer` and `inner` fields in here, to use instead of `ReusableBuffers2d`.
+    bufs_2d: ReusableBuffers2d,
+    reuse_bufs_1d: ReusableBuffers1d,
+}
 
 impl State {
-    fn new(size: usize) -> Self {
-        let n = size * size;
+    fn from_glyph(
+        mut glyph: Image2d<Unorm8, &mut [Unorm8]>,
+        params: Params,
+        reuse_bufs: Option<ReusableBuffers>,
+    ) -> Self {
+        let Params {
+            pad,
+            // FIXME(eddyb) should this still be taken as a separate `bool`?
+            preprocess: relax,
+            ..
+        } = params;
 
-        // FIXME(eddyb) use `v: Vec<u32>` or expose this limitation gracefully.
-        assert_eq!(size as u16 as usize, size);
+        let wp = glyph.width() + pad * 2;
+        let hp = glyph.height() + pad * 2;
+        let np = wp * hp;
 
-        let outer = vec![0.0; n];
-        let inner = vec![0.0; n];
-
-        let xo = vec![0.0; n];
-        let yo = vec![0.0; n];
-        let xi = vec![0.0; n];
-        let yi = vec![0.0; n];
-
-        let f = vec![0.0; size];
-        let z = vec![0.0; size + 1];
-        let b = vec![0.0; size];
-        let t = vec![0.0; size];
-        let v = vec![0; size];
-
-        Self {
+        let ReusableBuffers(bufs_2d, reuse_bufs_1d) = reuse_bufs.unwrap_or_default();
+        let mut state = Self {
+            bufs_2d,
+            reuse_bufs_1d,
+        };
+        let ReusableBuffers2d {
             outer,
             inner,
             xo,
             yo,
             xi,
             yi,
-            f,
-            z,
-            b,
-            t,
-            v,
+        } = &mut state.bufs_2d;
+
+        outer.resize_and_fill_with(wp, hp, true);
+        inner.resize_and_fill_with(wp, hp, false);
+        for buf2d in [&mut *xo, yo, xi, yi] {
+            buf2d.clear();
+            buf2d.resize(np, 0.0);
         }
-    }
 
-    fn init_from_alpha(&mut self, data: &mut [u8], w: usize, h: usize, pad: usize) {
-        let wp = w + pad * 2;
-        let hp = h + pad * 2;
-        let np = wp * hp;
-
-        let Self { outer, inner, .. } = self;
-
-        outer[..np].fill(INF);
-        inner[..np].fill(0.0);
-
-        for y in 0..h {
-            for x in 0..w {
-                let a = &mut data[y * w + x];
-                if *a == 0 {
+        for y in 0..glyph.height() {
+            for x in 0..glyph.width() {
+                let a = &mut glyph[(x, y)];
+                if *a == Unorm8::MIN {
                     continue;
                 }
 
-                let i = (y + pad) * wp + x + pad;
-                if *a >= 254 {
+                // FIXME(eddyb) audit all comparisons with `254` and try removing them,
+                // especially this step that modifies the `glyph` itself.
+                if *a >= Unorm8::from_bits(254) {
                     // Fix for bad rasterizer rounding
-                    *a = 255;
+                    *a = Unorm8::MAX;
 
-                    outer[i] = 0.0;
-                    inner[i] = INF;
+                    outer.at(x + pad, y + pad).set(false);
+                    inner.at(x + pad, y + pad).set(true);
                 } else {
-                    outer[i] = 0.0;
-                    inner[i] = 0.0;
+                    outer.at(x + pad, y + pad).set(false);
+                    inner.at(x + pad, y + pad).set(false);
                 }
             }
         }
-    }
 
-    // Generate subpixel offsets for all border pixels
-    fn compute_subpixel_offsets(
-        &mut self,
-        data: &[u8],
-        w: usize,
-        h: usize,
-        pad: usize,
-        relax: bool,
-    ) {
-        let wp = w + pad * 2;
-        let hp = h + pad * 2;
-        let np = wp * hp;
-
-        let Self {
-            outer,
-            inner,
-            xo,
-            yo,
-            xi,
-            yi,
-            ..
-        } = self;
-
-        xo[..np].fill(0.0);
-        yo[..np].fill(0.0);
-        xi[..np].fill(0.0);
-        yi[..np].fill(0.0);
+        //
+        // Generate subpixel offsets for all border pixels
+        //
 
         let get_data = |x: isize, y: isize| {
-            if x >= 0 && (x as usize) < w && y >= 0 && (y as usize) < h {
-                data[(y as usize) * w + (x as usize)] as f32 / 255.0
+            if x >= 0 && (x as usize) < glyph.width() && y >= 0 && (y as usize) < glyph.height() {
+                glyph[(x as usize, y as usize)].decode()
             } else {
                 0.0
             }
         };
 
         // Make vector from pixel center to nearest boundary
-        for y in 0..(h as isize) {
-            for x in 0..(w as isize) {
+        for y in 0..(glyph.height() as isize) {
+            for x in 0..(glyph.width() as isize) {
                 let c = get_data(x, y);
                 // NOTE(eddyb) `j - 1` (X-) / `j - wp` (Y-) positive (`pad >= 1`).
                 let j = ((y as usize) + pad) * wp + (x as usize) + pad;
@@ -400,18 +349,18 @@ impl State {
 
                     if min > 0.0 {
                         // Interior creases
-                        inner[j] = INF;
+                        inner.at(x as usize + pad, y as usize + pad).set(true);
                         continue;
                     }
                     if max < 1.0 {
                         // Exterior creases
-                        outer[j] = INF;
+                        outer.at(x as usize + pad, y as usize + pad).set(true);
                         continue;
                     }
 
                     let mut dx = rr - ll;
                     let mut dy = bb - tt;
-                    let dl = 1.0 / (sqr(dx) + sqr(dy)).sqrt();
+                    let dl = 1.0 / (dx.powi(2) + dy.powi(2)).sqrt();
                     dx *= dl;
                     dy *= dl;
 
@@ -426,24 +375,24 @@ impl State {
 
                     if is_black(l) {
                         xo[j - 1] = 0.4999;
-                        outer[j - 1] = 0.0;
-                        inner[j - 1] = 0.0;
+                        outer.at(x as usize + pad - 1, y as usize + pad).set(false);
+                        inner.at(x as usize + pad - 1, y as usize + pad).set(false);
                     }
                     if is_black(r) {
                         xo[j + 1] = -0.4999;
-                        outer[j + 1] = 0.0;
-                        inner[j + 1] = 0.0;
+                        outer.at(x as usize + pad + 1, y as usize + pad).set(false);
+                        inner.at(x as usize + pad + 1, y as usize + pad).set(false);
                     }
 
                     if is_black(t) {
                         yo[j - wp] = 0.4999;
-                        outer[j - wp] = 0.0;
-                        inner[j - wp] = 0.0;
+                        outer.at(x as usize + pad, y as usize + pad - 1).set(false);
+                        inner.at(x as usize + pad, y as usize + pad - 1).set(false);
                     }
                     if is_black(b) {
                         yo[j + wp] = -0.4999;
-                        outer[j + wp] = 0.0;
-                        inner[j + wp] = 0.0;
+                        outer.at(x as usize + pad, y as usize + pad + 1).set(false);
+                        inner.at(x as usize + pad, y as usize + pad + 1).set(false);
                     }
                 }
             }
@@ -459,8 +408,8 @@ impl State {
                     && ((dxl * dxr + dyl * dyr) * (dl * dr) > 0.0)
             };
 
-            for y in 0..(h as isize) {
-                for x in 0..(w as isize) {
+            for y in 0..(glyph.height() as isize) {
+                for x in 0..(glyph.width() as isize) {
                     // NOTE(eddyb) `j - 1` (X-) / `j - wp` (Y-) positive (`pad >= 1`).
                     let j = ((y as usize) + pad) * wp + (x as usize) + pad;
 
@@ -559,8 +508,8 @@ impl State {
 
         // Produce zero points for positive and negative DF, at +0.5 / -0.5.
         // Splits xs into xo/xi
-        for y in 0..(h as isize) {
-            for x in 0..(w as isize) {
+        for y in 0..(glyph.height() as isize) {
+            for x in 0..(glyph.width() as isize) {
                 // NOTE(eddyb) `j - 1` (X-) / `j - wp` (Y-) positive (`pad >= 1`).
                 let j = ((y as usize) + pad) * wp + (x as usize) + pad;
 
@@ -574,7 +523,7 @@ impl State {
                     continue;
                 }
 
-                let nn = (sqr(nx) + sqr(ny)).sqrt();
+                let nn = (nx.powi(2) + ny.powi(2)).sqrt();
 
                 let sx = if ((nx / nn).abs() - 0.5) > 0.0 {
                     nx.signum() as isize
@@ -601,129 +550,185 @@ impl State {
                 yi[j] = ny * dli;
             }
         }
+
+        state
+    }
+
+    fn esdt_outer_and_inner(&mut self, w: usize, h: usize) {
+        {
+            let Self {
+                bufs_2d:
+                    ReusableBuffers2d {
+                        outer,
+                        inner,
+                        xo,
+                        yo,
+                        xi,
+                        yi,
+                    },
+                reuse_bufs_1d,
+            } = self;
+            esdt(outer, xo, yo, w, h, reuse_bufs_1d);
+            esdt(inner, xi, yi, w, h, reuse_bufs_1d);
+        }
     }
 }
 
 // 2D subpixel distance transform by unconed
 // extended from Felzenszwalb & Huttenlocher https://cs.brown.edu/~pff/papers/dt-final.pdf
 fn esdt(
-    mask: &mut [f32],
+    mask: &mut Bitmap,
     xs: &mut [f32],
     ys: &mut [f32],
     w: usize,
     h: usize,
-    f: &mut [f32],
-    z: &mut [f32],
-    b: &mut [f32],
-    t: &mut [f32],
-    v: &mut [u16],
+    reuse_bufs_1d: &mut ReusableBuffers1d,
 ) {
-    // FIXME(eddyb) use `v: &mut [u32]` or expose this limitation gracefully.
-    let w_as_u16 = u16::try_from(w).unwrap();
-    let h_as_u16 = u16::try_from(h).unwrap();
+    reuse_bufs_1d.critical_minima.clear();
+    reuse_bufs_1d.critical_minima.reserve(w.max(h));
+
+    let mut xs = Image2d::from_storage(w, h, xs);
+    let mut ys = Image2d::from_storage(w, h, ys);
 
     for x in 0..w {
-        esdt1d(mask, ys, xs, x, w, h_as_u16, f, z, b, t, v)
+        let mut mask_xy_cursor = mask
+            .cursor_at(0, 0)
+            .zip(
+                // FIXME(eddyb) combine `xs` and `ys` into the same `Image2d`.
+                ys.cursor_at(0, 0).zip(xs.cursor_at(0, 0)),
+            )
+            .map_abs_and_rel(move |y| (x, y), |dy| (0, dy));
+        mask_xy_cursor.reset(0);
+
+        esdt1d(mask_xy_cursor, h, reuse_bufs_1d)
     }
     for y in 0..h {
-        esdt1d(mask, xs, ys, y * w, 1, w_as_u16, f, z, b, t, v)
+        let mut mask_xy_cursor = mask
+            .cursor_at(0, 0)
+            .zip(
+                // FIXME(eddyb) combine `xs` and `ys` into the same `Image2d`.
+                xs.cursor_at(0, 0).zip(ys.cursor_at(0, 0)),
+            )
+            .map_abs_and_rel(move |x| (x, y), |dx| (dx, 0));
+        mask_xy_cursor.reset(0);
+
+        esdt1d(mask_xy_cursor, w, reuse_bufs_1d)
     }
+}
+
+/// 1D buffers (for `esdt1d`), which get reused between calls.
+//
+// FIXME(eddyb) the name is outdated now that there's only one buffer.
+#[derive(Default)]
+struct ReusableBuffers1d {
+    critical_minima: Vec<CriticalMinimum>,
+}
+
+// FIXME(eddyb) clean up the names after all the refactors.
+struct CriticalMinimum {
+    // FIXME(eddyb) this is really just a position, since it's not used to
+    // index anything indirectly anymore, but rather indicates the original `q`,
+    // and is used to compare against it in the second iteration of `esdt1d`.
+    v: usize, // Array index
+
+    z: f32, // Voronoi threshold
+    f: f32, // Squared distance
+    b: f32, // Subpixel offset parallel
+    t: f32, // Subpixel offset perpendicular
 }
 
 // 1D subpixel distance transform
 fn esdt1d(
-    mask: &mut [f32],
-    xs: &mut [f32],
-    ys: &mut [f32],
-    offset: usize,
-    stride: usize,
-    length: u16,
-    f: &mut [f32], // Squared distance
-    z: &mut [f32], // Voronoi threshold
-    b: &mut [f32], // Subpixel offset parallel
-    t: &mut [f32], // Subpixel offset perpendicular
-    v: &mut [u16], // Array index
+    mut mask_xy_cursor: impl for<'a> NDCursor<
+        'a,
+        usize,
+        RefMut = (crate::img::BitmapEntry<'a>, (&'a mut f32, &'a mut f32)),
+    >,
+    // FIXME(eddyb) provide this through the cursor, maybe?
+    length: usize,
+    reuse_bufs_1d: &mut ReusableBuffers1d,
 ) {
-    v[0] = 0;
-    b[0] = xs[offset];
-    t[0] = ys[offset];
-    z[0] = -INF;
-    z[1] = INF;
-    f[0] = if mask[offset] != 0.0 {
-        INF
-    } else {
-        ys[offset] * ys[offset]
-    };
+    // FIXME(eddyb) this is a pretty misleading name.
+    const INF: f32 = 1e10;
+
+    let cm = &mut reuse_bufs_1d.critical_minima;
+    cm.clear();
+
+    {
+        let (mask, (&mut dx, &mut dy)) = mask_xy_cursor.get_mut();
+        cm.push(CriticalMinimum {
+            v: 0,
+            z: -INF,
+            f: if mask.get() { INF } else { dy.powi(2) },
+
+            b: dx,
+            t: dy,
+        });
+        mask_xy_cursor.advance(1);
+    }
 
     // Scan along array and build list of critical minima
-    {
-        let mut k_len = 1;
-        for q in 1..length {
-            let o = offset + usize::from(q) * stride;
+    for q in 1..length {
+        // Perpendicular
+        let (mask, (&mut dx, &mut dy)) = mask_xy_cursor.get_mut();
+        let fq = if mask.get() { INF } else { dy.powi(2) };
+        mask_xy_cursor.advance(1);
 
-            // Perpendicular
-            let dx = xs[o];
-            let dy = ys[o];
-            let fq = if mask[o] != 0.0 { INF } else { dy * dy };
-            f[usize::from(q)] = fq;
-            t[usize::from(q)] = dy;
+        // Parallel
+        let qs = q as f32 + dx;
+        let q2 = qs.powi(2);
 
-            // Parallel
-            let qs = q as f32 + dx;
-            let q2 = qs * qs;
-            b[usize::from(q)] = qs;
+        // Remove any minima eclipsed by this one
+        let mut s;
+        loop {
+            let r = &cm[cm.len() - 1];
 
-            // Remove any minima eclipsed by this one
-            let mut s;
-            loop {
-                let r = usize::from(v[k_len - 1]);
-                let rs = b[r];
+            s = (fq - r.f + q2 - r.b.powi(2)) / (qs - r.b) / 2.0;
 
-                let r2 = rs * rs;
-                s = (fq - f[r] + q2 - r2) / (qs - rs) / 2.0;
-
-                if !(s <= z[k_len - 1]) {
-                    break;
-                }
-
-                k_len -= 1;
-                if k_len == 0 {
-                    break;
-                }
+            if !(s <= r.z) {
+                break;
             }
 
-            // Add to minima list
-            v[k_len] = q;
-            z[k_len] = s;
-            z[k_len + 1] = INF;
-            k_len += 1;
+            cm.pop();
+            if cm.len() == 0 {
+                break;
+            }
         }
+
+        // Add to minima list
+        cm.push(CriticalMinimum {
+            v: q,
+            z: s,
+            f: fq,
+            b: qs,
+            t: dy,
+        });
     }
+
+    mask_xy_cursor.reset(0);
 
     // Resample array based on critical minima
     {
         let mut k = 0;
         for q in 0..length {
             // Skip eclipsed minima
-            while z[k + 1] < q as f32 {
+            while k + 1 < cm.len() && cm[k + 1].z < q as f32 {
                 k += 1;
             }
 
-            let r = v[k];
-            let rs = b[usize::from(r)];
-            let dy = t[usize::from(r)];
+            let r = &cm[k];
 
             // Distance from integer index to subpixel location of minimum
-            let rq = rs - q as f32;
+            let rq = r.b - q as f32;
 
-            let o = offset + usize::from(q) * stride;
-            xs[o] = rq;
-            ys[o] = dy;
-
+            let (mut mask, (dx, dy)) = mask_xy_cursor.get_mut();
+            *dx = rq;
+            *dy = r.t;
             // Mark cell as having propagated
-            if r != q {
-                mask[o] = 0.0;
+            if r.v != q {
+                mask.set(false);
             }
+            mask_xy_cursor.advance(1);
         }
     }
 }
