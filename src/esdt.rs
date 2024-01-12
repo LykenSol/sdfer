@@ -56,7 +56,7 @@ pub fn glyph_to_sdf(
 fn solidify_alpha(mut glyph: Image2d<Unorm8, &mut [Unorm8]>) {
     let (w, h) = (glyph.width(), glyph.height());
 
-    let mut mask: Vec<u8> = vec![0; w * h];
+    let mut mask: Image2d<u8> = Image2d::new(w, h);
 
     let get_data = |x: isize, y: isize| {
         if x >= 0 && (x as usize) < w && y >= 0 && (y as usize) < h {
@@ -72,8 +72,6 @@ fn solidify_alpha(mut glyph: Image2d<Unorm8, &mut [Unorm8]>) {
     // and who don't have black or white neighbors.
     for y in 0..(h as isize) {
         for x in 0..(w as isize) {
-            let o = (x as usize) + (y as usize) * w;
-
             let a = get_data(x, y);
             // FIXME(eddyb) audit all comparisons with `254` and try removing them.
             if a == Unorm8::MIN || a >= Unorm8::from_bits(254) {
@@ -95,12 +93,15 @@ fn solidify_alpha(mut glyph: Image2d<Unorm8, &mut [Unorm8]>) {
 
             // FIXME(eddyb) audit all comparisons with `254` and try removing them.
             if (max - min) < 16 && min > 0 && max < 254 {
+                // NOTE(eddyb) `min > 0` guarantees all neighbors are in-bounds.
+                let (x, y) = (x as usize, y as usize);
+
                 // Spread to 4 neighbors with max
-                mask[o - 1] = mask[o - 1].max(a);
-                mask[o - w] = mask[o - w].max(a);
-                mask[o] = a;
-                mask[o + 1] = mask[o + 1].max(a);
-                mask[o + w] = mask[o + w].max(a);
+                mask[(x - 1, y)] = mask[(x - 1, y)].max(a);
+                mask[(x, y - 1)] = mask[(x, y - 1)].max(a);
+                mask[(x, y)] = a;
+                mask[(x + 1, y)] = mask[(x + 1, y)].max(a);
+                mask[(x, y + 1)] = mask[(x, y + 1)].max(a);
                 masked += 1;
             }
         }
@@ -110,12 +111,18 @@ fn solidify_alpha(mut glyph: Image2d<Unorm8, &mut [Unorm8]>) {
         return;
     }
 
-    let get_mask = |x, y| mask[y * w + x];
+    let get_mask = |x: isize, y: isize| {
+        if x >= 0 && (x as usize) < w && y >= 0 && (y as usize) < h {
+            mask[(x as usize, y as usize)]
+        } else {
+            0
+        }
+    };
 
     // Sample 3x3 area for alpha normalization factor
-    for y in 0..h {
-        for x in 0..w {
-            let a = &mut glyph[(x, y)];
+    for y in 0..(h as isize) {
+        for x in 0..(w as isize) {
+            let a = &mut glyph[(x as usize, y as usize)];
             // FIXME(eddyb) audit all comparisons with `254` and try removing them.
             if *a == Unorm8::MIN || *a >= Unorm8::from_bits(254) {
                 continue;
@@ -133,11 +140,10 @@ fn solidify_alpha(mut glyph: Image2d<Unorm8, &mut [Unorm8]>) {
             let bl = get_mask(x - 1, y + 1);
             let br = get_mask(x + 1, y + 1);
 
-            let m = [c, l, r, t, b, tl, tr, bl, br]
+            if let Some(m) = [c, l, r, t, b, tl, tr, bl, br]
                 .into_iter()
                 .find(|&x| x != 0)
-                .unwrap_or(0);
-            if m != 0 {
+            {
                 *a = Unorm8::from_bits((a.to_bits() as f32 / m as f32 * 255.0) as u8);
             }
         }
