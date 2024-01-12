@@ -1,6 +1,4 @@
-//! SDF ("Signed Distance Field") generation algorithms.
-//!
-//! (see per-module documentation for more details)
+#![doc = include_str!("../README.md")]
 
 pub mod bruteforce_bitmap;
 pub mod esdt;
